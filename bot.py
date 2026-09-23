@@ -14,7 +14,7 @@ Gebruik:
   Link sturen, eventueel met een vraag erbij
   "Herinner me vrijdag om 9 aan de tandarts"
   "Elke maandag om 8 vuilnis buiten zetten"
-  /briefje, /week, /weer, /status, /bronnen, /versie
+  /briefje, /week, /weer, /status, /gebruik, /bronnen, /versie
   /herinner 10m thee        vaste notatie blijft ook werken
   /lijst, /verwijder 2, /reset, /help
 
@@ -49,7 +49,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from google import genai
 from google.genai import types
-from telegram import LinkPreviewOptions, Update
+from telegram import BotCommand, BotCommandScopeChat, LinkPreviewOptions, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -200,10 +200,26 @@ HELP_TEXT = (
     "/week: weekoverzicht nu\n"
     "/weer: komend uur en per dagdeel\n"
     "/status: laptop-status\n"
+    "/gebruik: Gemini-gebruik en drukte\n"
     "/bronnen: check de nieuwsfeeds\n"
     "/versie: draait de nieuwste versie?\n"
     "/reset: vergeet het gesprek tot nu toe"
 )
+
+BOT_COMMANDS = [
+    ("briefje", "Briefje met weer en nieuws"),
+    ("weer", "Weer: komend uur en per dagdeel"),
+    ("week", "Financieel weekoverzicht"),
+    ("lijst", "Toon herinneringen"),
+    ("verwijder", "Verwijder herinnering, bijv. /verwijder 2"),
+    ("herinner", "Herinnering, bijv. /herinner 10m thee"),
+    ("status", "Laptop-status"),
+    ("gebruik", "Gemini-gebruik en drukte"),
+    ("bronnen", "Controleer de nieuwsfeeds"),
+    ("versie", "Draait de nieuwste versie?"),
+    ("reset", "Vergeet het gesprek tot nu toe"),
+    ("help", "Alle mogelijkheden"),
+]
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -244,6 +260,8 @@ CONFIG = load_config(CONFIG_PATH)
 TELEGRAM_TOKEN = CONFIG["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = CONFIG["GEMINI_API_KEY"]
 GEMINI_MODEL = CONFIG.get("GEMINI_MODEL") or "gemini-3.6-flash"
+FALLBACK_SETTING = CONFIG.get("GEMINI_FALLBACK_MODEL", "auto")
+fallback_model = ""  # wordt bij het opstarten bepaald
 ALLOWED_USER_ID = int(CONFIG.get("ALLOWED_USER_ID") or 0)
 BRIEF_TIME = parse_clock(CONFIG.get("BRIEF_TIME", "07:00"))
 BRIEF_TIME_WEEKEND = parse_clock(CONFIG.get("BRIEF_TIME_WEEKEND", "09:00"))
@@ -258,6 +276,7 @@ DISK_ALERT = float(CONFIG.get("DISK_ALERT") or 90)
 gemini = genai.Client(api_key=GEMINI_API_KEY)
 history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 last_alert: dict[str, datetime] = {}
+gemini_events: deque = deque(maxlen=2000)  # (tijdstip, soort) voor /gebruik
 
 
 # ---------- Gemini met herkansing ----------
@@ -289,21 +308,74 @@ def short_reason(exc: Exception) -> str:
 
 
 async def generate(contents, system: str, json_output: bool = False):
-    """Vraag aan Gemini, met twee herkansingen bij tijdelijke fouten."""
+    """Vraag aan Gemini, met herkansingen en zo nodig een reservemodel."""
+    config = gen_config(system, json_output)
     last_exc = None
+    track("verzoek")
     for delay in (0, 5, 20):
         if delay:
             await asyncio.sleep(delay)
         try:
-            return await gemini.aio.models.generate_content(
-                model=GEMINI_MODEL, contents=contents, config=gen_config(system, json_output)
+            response = await gemini.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=contents, config=config
             )
+            track("gelukt")
+            return response
         except Exception as exc:
             last_exc = exc
+            track(error_kind(exc))
             if not is_retryable(exc):
                 raise
             log.warning("Gemini tijdelijk niet beschikbaar, nieuwe poging: %s", exc)
+    if fallback_model:
+        log.warning("Hoofdmodel onbereikbaar, probeer reservemodel %s.", fallback_model)
+        try:
+            response = await gemini.aio.models.generate_content(
+                model=fallback_model, contents=contents, config=config
+            )
+        except Exception as exc:
+            track(error_kind(exc))
+            track("mislukt")
+            raise
+        track("reserve")
+        track("gelukt")
+        return response
+    track("mislukt")
     raise last_exc
+
+
+def track(kind: str) -> None:
+    gemini_events.append((datetime.now(TZ), kind))
+
+
+def error_kind(exc: Exception) -> str:
+    s = str(exc)
+    if "429" in s or "RESOURCE_EXHAUSTED" in s:
+        return "limiet"
+    if is_retryable(exc):
+        return "overbelast"
+    return "fout"
+
+
+async def detect_fallback_model() -> str:
+    """Kies een lichter reservemodel voor als het hoofdmodel overbelast is."""
+    if FALLBACK_SETTING.lower() in ("", "uit", "off", "nee"):
+        return ""
+    if FALLBACK_SETTING.lower() != "auto":
+        return FALLBACK_SETTING
+    try:
+        names = []
+        async for model in await gemini.aio.models.list():
+            actions = getattr(model, "supported_actions", None) or []
+            name = (model.name or "").removeprefix("models/")
+            if "generateContent" in actions and "flash-lite" in name and name != GEMINI_MODEL:
+                names.append(name)
+    except Exception as exc:
+        log.warning("Modellijst ophalen mislukt: %s", exc)
+        return ""
+    stable = [n for n in names if "preview" not in n and "exp" not in n]
+    candidates = sorted(stable or names, reverse=True)
+    return candidates[0] if candidates else ""
 
 
 def remember(chat_id: int, user_text: str, answer: str) -> None:
@@ -834,6 +906,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Geheugen: {memory_text()}",
         "Herstart nodig: " + ("nee" if reboot is None else f"ja, sinds {reboot:.0f} uur"),
         f"AI-model: {GEMINI_MODEL}",
+        f"Reservemodel: {fallback_model or 'geen'}",
         f"Botversie: {RUNNING_VERSION}",
     ]
     await update.effective_message.reply_text("\n".join(lines))
@@ -865,6 +938,38 @@ async def cmd_versie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as exc:
         log.warning("GitHub-versie ophalen mislukt: %s", exc)
         lines.append("Versie op GitHub: kon ik niet ophalen.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def cmd_gebruik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    now = datetime.now(TZ)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def count(since: datetime) -> dict:
+        totals = defaultdict(int)
+        for ts, kind in gemini_events:
+            if ts >= since:
+                totals[kind] += 1
+        return totals
+
+    day, hour = count(midnight), count(now - timedelta(hours=1))
+    problems = [ts for ts, kind in gemini_events if kind in ("overbelast", "limiet")]
+    since_start = "" if STARTED_AT < midnight else f" (sinds herstart om {STARTED_AT:%H:%M})"
+    lines = [
+        f"📊 Gemini-gebruik vandaag{since_start}",
+        f"Verzoeken: {day['verzoek']} (gelukt: {day['gelukt']}, mislukt: {day['mislukt']})",
+        f"Overbelast-meldingen: {day['overbelast']}",
+        f"Limiet-meldingen: {day['limiet']}",
+        f"Opgevangen door reservemodel: {day['reserve']}",
+        "",
+        f"Afgelopen uur: {hour['verzoek']} verzoeken, {hour['overbelast']} keer overbelast",
+        f"Laatste drukte: {problems[-1]:%H:%M}" if problems else "Laatste drukte: geen",
+        "",
+        "Storingen bij Google: aistudio.google.com/status",
+        "Je daglimiet: aistudio.google.com (Usage)",
+    ]
     await update.effective_message.reply_text("\n".join(lines))
 
 
@@ -1201,8 +1306,14 @@ async def ask_gemini(chat_id: int, question: str) -> str:
     return answer
 
 
+HELP_QUESTION = re.compile(r"\b(commando'?s?|commands?|wat kan je|wat kun je|hulp|help)\b", re.IGNORECASE)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     msg = update.effective_message
+    if len(text) < 60 and HELP_QUESTION.search(text):
+        await msg.reply_text(HELP_TEXT)
+        return
     await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
 
     url_match = URL_RE.search(text)
@@ -1342,8 +1453,21 @@ async def on_startup(app: Application) -> None:
         count += 1
     log.info("%d herinnering(en) ingepland na opstarten.", count)
 
+    global fallback_model
+    fallback_model = await detect_fallback_model()
+    log.info("Reservemodel: %s", fallback_model or "geen")
+
     if not ALLOWED_USER_ID:
         return
+    # Commandomenu in Telegram, alleen zichtbaar in jouw chat
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(name, desc) for name, desc in BOT_COMMANDS],
+            scope=BotCommandScopeChat(chat_id=ALLOWED_USER_ID),
+        )
+    except Exception as exc:
+        log.warning("Commandomenu instellen mislukt: %s", exc)
+
     # python-telegram-bot telt dagen als 0 = zondag tot 6 = zaterdag
     if BRIEF_TIME:
         app.job_queue.run_daily(morning_job, time=BRIEF_TIME, days=(1, 2, 3, 4, 5), name="briefje-week")
@@ -1372,6 +1496,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
     app.add_handler(CommandHandler("bronnen", cmd_bronnen, filters=private))
     app.add_handler(CommandHandler("versie", cmd_versie, filters=private))
+    app.add_handler(CommandHandler("gebruik", cmd_gebruik, filters=private))
     app.add_handler(CommandHandler("herinner", cmd_herinner, filters=private))
     app.add_handler(CommandHandler("lijst", cmd_lijst, filters=private))
     app.add_handler(CommandHandler("verwijder", cmd_verwijder, filters=private))
