@@ -14,7 +14,7 @@ Gebruik:
   Link sturen, eventueel met een vraag erbij
   "Herinner me vrijdag om 9 aan de tandarts"
   "Elke maandag om 8 vuilnis buiten zetten"
-  /briefje, /week, /weer, /status, /bronnen
+  /briefje, /week, /weer, /status, /bronnen, /versie
   /herinner 10m thee        vaste notatie blijft ook werken
   /lijst, /verwijder 2, /reset, /help
 
@@ -31,6 +31,7 @@ Optionele instellingen in assistent.env:
 """
 
 import asyncio
+import hashlib
 import html
 import ipaddress
 import json
@@ -71,6 +72,9 @@ MAX_IMAGE_BYTES = 10_000_000
 MAX_PAGE_BYTES = 2_000_000
 ALERT_COOLDOWN = timedelta(hours=6)
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+REPO_BOT_URL = "https://raw.githubusercontent.com/F0xmountain/assistent/main/bot.py"
+RUNNING_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:8]
+STARTED_AT = datetime.now(TZ)
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (persoonlijke-assistent)"}
 DAGEN = ["ma", "di", "wo", "do", "vr", "za", "zo"]          # Python: 0 = maandag
 PTB_DAGEN = ["zo", "ma", "di", "wo", "do", "vr", "za"]      # telegram: 0 = zondag
@@ -197,6 +201,7 @@ HELP_TEXT = (
     "/weer: komend uur en per dagdeel\n"
     "/status: laptop-status\n"
     "/bronnen: check de nieuwsfeeds\n"
+    "/versie: draait de nieuwste versie?\n"
     "/reset: vergeet het gesprek tot nu toe"
 )
 
@@ -829,7 +834,37 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Geheugen: {memory_text()}",
         "Herstart nodig: " + ("nee" if reboot is None else f"ja, sinds {reboot:.0f} uur"),
         f"AI-model: {GEMINI_MODEL}",
+        f"Botversie: {RUNNING_VERSION}",
     ]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def cmd_versie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    installed = datetime.fromtimestamp(Path(__file__).stat().st_mtime, TZ)
+    lines = [
+        "🧩 Botversie",
+        f"Draaiende versie: {RUNNING_VERSION}",
+        f"Geïnstalleerd: {fmt(installed)}",
+        f"Gestart: {fmt(STARTED_AT)}",
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=15, headers={"Cache-Control": "no-cache"}) as client:
+            r = await client.get(REPO_BOT_URL)
+            r.raise_for_status()
+        github = hashlib.sha256(r.content).hexdigest()[:8]
+        lines.append(f"Versie op GitHub: {github}")
+        if github == RUNNING_VERSION:
+            lines.append("✅ Je draait de nieuwste versie.")
+        else:
+            lines.append(
+                "⏳ Op GitHub staat een andere versie. Die wordt binnen ongeveer 10 minuten "
+                "automatisch geïnstalleerd; GitHub kan zelf ook een paar minuten achterlopen."
+            )
+    except Exception as exc:
+        log.warning("GitHub-versie ophalen mislukt: %s", exc)
+        lines.append("Versie op GitHub: kon ik niet ophalen.")
     await update.effective_message.reply_text("\n".join(lines))
 
 
@@ -1336,6 +1371,7 @@ def main() -> None:
     app.add_handler(CommandHandler("weer", cmd_weer, filters=private))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
     app.add_handler(CommandHandler("bronnen", cmd_bronnen, filters=private))
+    app.add_handler(CommandHandler("versie", cmd_versie, filters=private))
     app.add_handler(CommandHandler("herinner", cmd_herinner, filters=private))
     app.add_handler(CommandHandler("lijst", cmd_lijst, filters=private))
     app.add_handler(CommandHandler("verwijder", cmd_verwijder, filters=private))
