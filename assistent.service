@@ -1,0 +1,27 @@
+[Unit]
+Description=Persoonlijke Telegram-assistent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=assistent
+Group=assistent
+ExecStart=/opt/assistent/venv/bin/python /opt/assistent/bot.py
+Restart=always
+RestartSec=10
+
+# Afscherming: de bot mag alleen in zijn eigen datamap schrijven
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/assistent/data
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
