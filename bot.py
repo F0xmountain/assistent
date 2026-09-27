@@ -38,6 +38,7 @@ import json
 import logging
 import re
 import shutil
+import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
@@ -883,6 +884,16 @@ def uptime_text() -> str:
     return f"{days} d {hours} u {rest // 60} min"
 
 
+def os_text() -> str:
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "onbekend"
+
+
 def memory_text() -> str:
     info = {}
     for line in Path("/proc/meminfo").read_text().splitlines():
@@ -904,6 +915,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"CPU-temperatuur: {temp:.0f} °C" if temp is not None else "CPU-temperatuur: onbekend",
         f"Schijf: {disk_percent():.0f}% vol",
         f"Geheugen: {memory_text()}",
+        f"Systeem: {os_text()}",
+        f"Python: {sys.version.split()[0]}",
         "Herstart nodig: " + ("nee" if reboot is None else f"ja, sinds {reboot:.0f} uur"),
         f"AI-model: {GEMINI_MODEL}",
         f"Reservemodel: {fallback_model or 'geen'}",
