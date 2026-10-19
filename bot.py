@@ -84,6 +84,7 @@ TELEGRAM_LIMIT = 4000
 MAX_VOICE_SECONDS = 300
 MAX_IMAGE_BYTES = 10_000_000
 MAX_PAGE_BYTES = 2_000_000
+MAX_REDIRECTS = 5
 ALERT_COOLDOWN = timedelta(hours=6)
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 REPO_BOT_URL = "https://raw.githubusercontent.com/F0xmountain/assistent/main/bot.py"
@@ -1722,35 +1723,45 @@ async def cmd_verwijder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------- Links samenvatten ----------
 
 async def is_public_host(host: str) -> bool:
-    """Weiger adressen in je eigen netwerk (router, laptop zelf)."""
+    """Weiger adressen in je eigen netwerk (router, laptop zelf, Tailscale)."""
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(host, None)
     except OSError:
         return False
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        # is_global is strenger dan is_private: ook 100.64.0.0/10 (Tailscale) valt af.
+        if not ip.is_global or ip.is_multicast:
             return False
     return True
 
 
 async def fetch_page(url: str):
-    host = urlparse(url).hostname
-    if not host or not await is_public_host(host):
-        raise ValueError("dit adres is niet toegestaan")
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=USER_AGENT) as client:
-        async with client.stream("GET", url) as r:
-            r.raise_for_status()
-            ctype = r.headers.get("content-type", "")
-            if "html" not in ctype and "text" not in ctype:
-                raise ValueError(f"geen webpagina ({ctype.split(';')[0] or 'onbekend type'})")
-            chunks, size = [], 0
-            async for chunk in r.aiter_bytes():
-                chunks.append(chunk)
-                size += len(chunk)
-                if size > MAX_PAGE_BYTES:
-                    break
-            raw = b"".join(chunks).decode(r.encoding or "utf-8", errors="replace")
+    # Redirects volgen we zelf, zodat ook elk doorverwijs-adres gecontroleerd wordt.
+    async with httpx.AsyncClient(timeout=20, headers=USER_AGENT) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            parsed = urlparse(url)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or not await is_public_host(parsed.hostname)):
+                raise ValueError("dit adres is niet toegestaan")
+            async with client.stream("GET", url) as r:
+                if r.is_redirect:
+                    url = str(r.url.join(r.headers["location"]))
+                    continue
+                r.raise_for_status()
+                ctype = r.headers.get("content-type", "")
+                if "html" not in ctype and "text" not in ctype:
+                    raise ValueError(f"geen webpagina ({ctype.split(';')[0] or 'onbekend type'})")
+                chunks, size = [], 0
+                async for chunk in r.aiter_bytes():
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > MAX_PAGE_BYTES:
+                        break
+                raw = b"".join(chunks).decode(r.encoding or "utf-8", errors="replace")
+            break
+        else:
+            raise ValueError("te veel doorverwijzingen")
     title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.S | re.I)
     raw = re.sub(r"(?is)<(script|style|noscript|svg|nav|footer|header|form)[^>]*>.*?</\1>", " ", raw)
     title = strip_tags(title_match.group(1)) if title_match else url
